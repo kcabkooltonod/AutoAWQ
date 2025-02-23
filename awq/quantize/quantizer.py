@@ -174,7 +174,7 @@ class AwqQuantizer:
 
     def quantize(self):
         with open('loss_scales_records_awq_modified.csv', 'w') as f:
-            f.write('layer_idx,best_scales,best_loss,name\n')
+            f.write('layer_idx,best_loss,name\n')
             for i in tqdm(range(len(self.modules)), desc="AWQ"):
                 # Move module and inputs to correct device
                 common_device = next(self.modules[i].parameters()).device
@@ -241,7 +241,7 @@ class AwqQuantizer:
                     
                 # 遍历 scales_list 和 best_loss_list，逐行写入数据
                 for idx, (scale, loss) in enumerate(zip(scales_list, best_loss_list)):
-                    f.write(f'{i},{scale[-1]},{loss},{scale[-2]}\n')
+                    f.write(f'{i},{loss},{scale[-2]}\n')
 
 
                 apply_scale(self.modules[i], scales_list, input_feat_dict=input_feat)
