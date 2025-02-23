@@ -75,10 +75,10 @@ class AwqQuantizer:
         # print(org_w_shape[0])
         w = w.reshape(org_w_shape[0], -1)
         # print(w.shape)
-        group_size_2d = self.group_size  # 二维块的边长
-        M, N = w.shape[-2], w.shape[-1]  # 假设权重是二维矩阵
+        group_size_2d = self.group_size  
+        M, N = w.shape[-2], w.shape[-1] 
         # print(M, N)
-        # 确保输入尺寸能被 group_size_2d 整除（若不能整除，这里会截断）
+        # 确保输入尺寸能被 group_size_2d 整除
         blocks_per_row = M // group_size_2d
         blocks_per_col = N // group_size_2d
         cropped_M = blocks_per_row * group_size_2d
@@ -87,14 +87,16 @@ class AwqQuantizer:
         # 截取可被整除的部分
         w = w[:cropped_M, :cropped_N]
 
-        # 将权重重新组织为二维块结构
         # w: [M, N] -> [blocks_per_row, blocks_per_col, group_size_2d, group_size_2d]
         w = w.view(
             blocks_per_row, group_size_2d,
             blocks_per_col, group_size_2d
         )
-        w = w.permute(0, 2, 1, 3)  # [blocks_per_row, blocks_per_col, group_size_2d, group_size_2d]
-        w = w.contiguous().view(-1, group_size_2d * group_size_2d)  # [总块数, 块内元素数]
+
+        # [blocks_per_row, blocks_per_col, group_size_2d, group_size_2d]
+        w = w.permute(0, 2, 1, 3)
+        # [blocks_per_row*blocks_per_col, group_size_2d*group_size_2d]
+        w = w.contiguous().view(-1, group_size_2d * group_size_2d)
 
         assert w.dim() == 2
         assert torch.isnan(w).sum() == 0
@@ -126,14 +128,14 @@ class AwqQuantizer:
         assert torch.isnan(scales).sum() == 0
         assert torch.isnan(w).sum() == 0
 
-        # 恢复原始形状（包含截断后的尺寸）
+        # 恢复原始形状
         scales = scales.view(blocks_per_row, blocks_per_col, group_size_2d, group_size_2d)
-        scales = scales.permute(0, 2, 1, 3)  # 恢复块的行列顺序
+        scales = scales.permute(0, 2, 1, 3)
         scales = scales.contiguous().view(cropped_M, cropped_N)
         scales = scales[:, ::128]
 
         w = w.view(blocks_per_row, blocks_per_col, group_size_2d, group_size_2d)
-        w = w.permute(0, 2, 1, 3)  # 恢复块的行列顺序
+        w = w.permute(0, 2, 1, 3)
         w = w.contiguous().view(cropped_M, cropped_N)
         w = w.reshape(org_w_shape)
 
@@ -172,7 +174,6 @@ class AwqQuantizer:
 
     def quantize(self):
         with open('loss_scales_records_awq_modified.csv', 'w') as f:
-            # 写入表头
             f.write('layer_idx,best_scales,best_loss,name\n')
             for i in tqdm(range(len(self.modules)), desc="AWQ"):
                 # Move module and inputs to correct device
@@ -236,7 +237,6 @@ class AwqQuantizer:
                     best_loss_list.append(best_loss)
 
                 # with open('loss_scales_records_awq_modified.csv', 'w') as f:
-                #     # 写入表头
                 #     f.write('layer_idx,best_scales,best_loss,name\n')
                     
                 # 遍历 scales_list 和 best_loss_list，逐行写入数据
@@ -366,39 +366,35 @@ class AwqQuantizer:
         weight = torch.cat([_m.weight for _m in layers], dim=0)
         org_shape = weight.shape
         # 新增：二维分块逻辑
-        #########################################################
-        # 确保输入尺寸能被 group_size 整除（若不能整除，这里会截断）
-        group_size_2d = self.group_size  # 二维分块的边长
-        M, N = org_shape[-2], org_shape[-1]  # 假设权重是二维矩阵
+        group_size_2d = self.group_size 
+        M, N = org_shape[-2], org_shape[-1]
 
-        # 计算可分割的块数并截断
         blocks_per_row = M // group_size_2d
         blocks_per_col = N // group_size_2d
         cropped_M = blocks_per_row * group_size_2d
         cropped_N = blocks_per_col * group_size_2d
 
-        # 截取可被整除的部分
         weight = weight[:cropped_M, :cropped_N]
 
-        # 将权重重新组织为二维块结构
-        # [总块数, 块内元素数] = [blocks_per_row*blocks_per_col, group_size_2d^2]
+        # [blocks_per_row*blocks_per_col, group_size_2d^2]
         weight_blocks = weight.view(
             blocks_per_row, group_size_2d,
             blocks_per_col, group_size_2d
         )
         # 调整维度顺序以合并块索引
-        weight_blocks = weight_blocks.permute(0, 2, 1, 3)  # [blocks_per_row, blocks_per_col, group_size_2d, group_size_2d]
+        # [blocks_per_row, blocks_per_col, group_size_2d, group_size_2d]
+        weight_blocks = weight_blocks.permute(0, 2, 1, 3)
         weight_blocks = weight_blocks.contiguous().view(-1, group_size_2d * group_size_2d)
 
         # 按二维块计算归一化
         w_scale = weight_blocks.abs() / (weight_blocks.abs().amax(dim=1, keepdim=True) + 1e-6)
 
-        # 恢复原始形状（包含截断后的尺寸）
+        # 恢复原始形状
         w_scale = w_scale.view(
             blocks_per_row, blocks_per_col,
             group_size_2d, group_size_2d
         )
-        w_scale = w_scale.permute(0, 2, 1, 3)  # 恢复块的行列顺序
+        w_scale = w_scale.permute(0, 2, 1, 3)
         w_scale = w_scale.contiguous().view(cropped_M, cropped_N)
 
         # 若原尺寸无法被整除，补零对齐原始形状
@@ -406,7 +402,6 @@ class AwqQuantizer:
             w_scale_full = torch.zeros(org_shape, dtype=w_scale.dtype, device=weight.device)
             w_scale_full[:cropped_M, :cropped_N] = w_scale
             w_scale = w_scale_full
-        #########################################################
 
         # 后续计算通道均值（与原逻辑一致）
         w_mean = w_scale.mean(0)
