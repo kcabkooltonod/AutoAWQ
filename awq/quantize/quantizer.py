@@ -72,16 +72,37 @@ class AwqQuantizer:
 
     def pseudo_quantize_tensor(self, w: torch.Tensor):
         org_w_shape = w.shape
-        if self.group_size > 0:
-            assert org_w_shape[-1] % self.group_size == 0, f"org_w_shape ({org_w_shape[-1]}) must be a multiple of group_size ({self.group_size})!"
-            w = w.reshape(-1, self.group_size)
+        # print(org_w_shape[0])
+        w = w.reshape(org_w_shape[0], -1)
+        # print(w.shape)
+        group_size_2d = self.group_size  # 二维块的边长
+        M, N = w.shape[-2], w.shape[-1]  # 假设权重是二维矩阵
+        # print(M, N)
+        # 确保输入尺寸能被 group_size_2d 整除（若不能整除，这里会截断）
+        blocks_per_row = M // group_size_2d
+        blocks_per_col = N // group_size_2d
+        cropped_M = blocks_per_row * group_size_2d
+        cropped_N = blocks_per_col * group_size_2d
+
+        # 截取可被整除的部分
+        w = w[:cropped_M, :cropped_N]
+
+        # 将权重重新组织为二维块结构
+        # w: [M, N] -> [blocks_per_row, blocks_per_col, group_size_2d, group_size_2d]
+        w = w.view(
+            blocks_per_row, group_size_2d,
+            blocks_per_col, group_size_2d
+        )
+        w = w.permute(0, 2, 1, 3)  # [blocks_per_row, blocks_per_col, group_size_2d, group_size_2d]
+        w = w.contiguous().view(-1, group_size_2d * group_size_2d)  # [总块数, 块内元素数]
+
         assert w.dim() == 2
         assert torch.isnan(w).sum() == 0
 
         # zero point quantization
         if self.zero_point:
-            max_val = w.amax(dim=1, keepdim=True)
-            min_val = w.amin(dim=1, keepdim=True)
+            max_val = w.amax(dim=1, keepdim=True).expand_as(w)
+            min_val = w.amin(dim=1, keepdim=True).expand_as(w)
             max_int = 2**self.w_bit - 1
             min_int = 0
             scales = (max_val - min_val).clamp(min=1e-5) / max_int
@@ -89,7 +110,10 @@ class AwqQuantizer:
             w = (
                 torch.clamp(torch.round(w / scales) + zeros, min_int, max_int) - zeros
             ) * scales
-            zeros = zeros.view(org_w_shape[0], -1)
+            zeros = zeros.view(blocks_per_row, blocks_per_col, group_size_2d, group_size_2d)
+            zeros = zeros.permute(0, 2, 1, 3)  # 恢复块的行列顺序
+            zeros = zeros.contiguous().view(cropped_M, cropped_N)
+            zeros = zeros[:, ::128]
         else:
             max_val = w.abs().amax(dim=1, keepdim=True)
             max_val = max_val.clamp(min=1e-5)
@@ -102,8 +126,31 @@ class AwqQuantizer:
         assert torch.isnan(scales).sum() == 0
         assert torch.isnan(w).sum() == 0
 
-        scales = scales.view(org_w_shape[0], -1)
+        # 恢复原始形状（包含截断后的尺寸）
+        scales = scales.view(blocks_per_row, blocks_per_col, group_size_2d, group_size_2d)
+        scales = scales.permute(0, 2, 1, 3)  # 恢复块的行列顺序
+        scales = scales.contiguous().view(cropped_M, cropped_N)
+        scales = scales[:, ::128]
+
+        w = w.view(blocks_per_row, blocks_per_col, group_size_2d, group_size_2d)
+        w = w.permute(0, 2, 1, 3)  # 恢复块的行列顺序
+        w = w.contiguous().view(cropped_M, cropped_N)
         w = w.reshape(org_w_shape)
+
+        # 若原尺寸无法被整除，补零对齐原始形状
+        if cropped_M < M or cropped_N < N:
+            w_full = torch.zeros(org_w_shape, dtype=w.dtype, device=w.device)
+            w_full[:cropped_M, :cropped_N] = w
+            w = w_full
+
+            scales_full = torch.zeros(org_w_shape, dtype=scales.dtype, device=w.device)
+            scales_full[:cropped_M, :cropped_N] = scales
+            scales = scales_full
+
+            if zeros is not None:
+                zeros_full = torch.zeros(org_w_shape, dtype=zeros.dtype, device=w.device)
+                zeros_full[:cropped_M, :cropped_N] = zeros
+                zeros = zeros_full
 
         return w, scales, zeros
 
@@ -124,82 +171,99 @@ class AwqQuantizer:
         return w
 
     def quantize(self):
-        for i in tqdm(range(len(self.modules)), desc="AWQ"):
-            # Move module and inputs to correct device
-            common_device = next(self.modules[i].parameters()).device
-            if common_device is None or str(common_device) == "cpu":
-                if torch.cuda.is_available():
-                    best_device = "cuda:" + str(i % torch.cuda.device_count())
-                else:
-                    best_device = get_best_device()
-
-                self.modules[i] = self.modules[i].to(best_device)
+        with open('loss_scales_records_awq_modified.csv', 'w') as f:
+            # 写入表头
+            f.write('layer_idx,best_scales,best_loss,name\n')
+            for i in tqdm(range(len(self.modules)), desc="AWQ"):
+                # Move module and inputs to correct device
                 common_device = next(self.modules[i].parameters()).device
+                if common_device is None or str(common_device) == "cpu":
+                    if torch.cuda.is_available():
+                        # best_device = "cuda:" + str(i % torch.cuda.device_count())
+                        best_device = "cuda:2"
+                    else:
+                        best_device = get_best_device()
 
-            if self.module_kwargs.get("position_ids") is not None:
-                self.module_kwargs["position_ids"] = self.module_kwargs[
-                    "position_ids"
-                ].to(common_device)
+                    self.modules[i] = self.modules[i].to(best_device)
+                    common_device = next(self.modules[i].parameters()).device
 
-            if self.module_kwargs.get("attention_mask") is not None:
-                self.module_kwargs["attention_mask"] = self.module_kwargs[
-                    "attention_mask"
-                ].to(common_device)
+                if self.module_kwargs.get("position_ids") is not None:
+                    self.module_kwargs["position_ids"] = self.module_kwargs[
+                        "position_ids"
+                    ].to(common_device)
 
-            self.inps = self.inps.to(common_device)
+                if self.module_kwargs.get("attention_mask") is not None:
+                    self.module_kwargs["attention_mask"] = self.module_kwargs[
+                        "attention_mask"
+                    ].to(common_device)
 
-            # We need to move the rotary embedding every time we move to a new module.
-            # Transformers 4.45.0 moved rotary embedding to model definition as of this PR:
-            # https://github.com/huggingface/transformers/pull/32617
-            self.awq_model.move_embed(self.model, common_device)
+                self.inps = self.inps.to(common_device)
 
-            for k, v in self.module_kwargs.items():
-                # position embeddings found in tuple
-                if isinstance(v, tuple):
-                    self.module_kwargs[k] = tuple(
-                        item.to(common_device) if isinstance(item, (torch.Tensor, nn.Module)) 
-                        else item for item in v
+                # We need to move the rotary embedding every time we move to a new module.
+                # Transformers 4.45.0 moved rotary embedding to model definition as of this PR:
+                # https://github.com/huggingface/transformers/pull/32617
+                self.awq_model.move_embed(self.model, common_device)
+
+                for k, v in self.module_kwargs.items():
+                    # position embeddings found in tuple
+                    if isinstance(v, tuple):
+                        self.module_kwargs[k] = tuple(
+                            item.to(common_device) if isinstance(item, (torch.Tensor, nn.Module)) 
+                            else item for item in v
+                        )
+
+                # [STEP 1]: Get layer, extract linear modules, extract input features
+                named_linears = get_named_linears(self.modules[i])
+
+                # Filter out the linear layers we don't want to exclude
+                named_linears = exclude_layers_to_not_quantize(
+                    named_linears, self.modules_to_not_convert
+                )
+
+                input_feat = self._get_input_feat(self.modules[i], named_linears)
+                clear_memory()
+
+                # [STEP 2]: Compute and apply scale list
+                module_config: List[Dict] = self.awq_model.get_layers_for_scaling(
+                    self.modules[i], input_feat, self.module_kwargs
+                )
+                scales_list = []
+                best_loss_list = []
+
+                for layer in module_config:
+                    scale, best_loss = self._search_best_scale(self.modules[i], **layer)
+                    scales_list.append(scale)
+                    best_loss_list.append(best_loss)
+
+                # with open('loss_scales_records_awq_modified.csv', 'w') as f:
+                #     # 写入表头
+                #     f.write('layer_idx,best_scales,best_loss,name\n')
+                    
+                # 遍历 scales_list 和 best_loss_list，逐行写入数据
+                for idx, (scale, loss) in enumerate(zip(scales_list, best_loss_list)):
+                    f.write(f'{i},{scale[-1]},{loss},{scale[-2]}\n')
+
+
+                apply_scale(self.modules[i], scales_list, input_feat_dict=input_feat)
+                scales_list = append_str_prefix(
+                    scales_list, get_op_name(self.model, self.modules[i]) + "."
+                )
+
+                # [STEP 3]: Compute and apply clipping list
+                if self.apply_clip:
+                    clip_list = self._search_best_clip(
+                        self.modules[i], named_linears, input_feat
+                    )
+                    apply_clip(self.modules[i], clip_list)
+                    clip_list = append_str_prefix(
+                        clip_list, get_op_name(self.model, self.modules[i]) + "."
                     )
 
-            # [STEP 1]: Get layer, extract linear modules, extract input features
-            named_linears = get_named_linears(self.modules[i])
+                # [STEP 4]: Quantize weights
+                if not self.export_compatible:
+                    self._apply_quant(self.modules[i], named_linears)
 
-            # Filter out the linear layers we don't want to exclude
-            named_linears = exclude_layers_to_not_quantize(
-                named_linears, self.modules_to_not_convert
-            )
-
-            input_feat = self._get_input_feat(self.modules[i], named_linears)
-            clear_memory()
-
-            # [STEP 2]: Compute and apply scale list
-            module_config: List[Dict] = self.awq_model.get_layers_for_scaling(
-                self.modules[i], input_feat, self.module_kwargs
-            )
-            scales_list = [
-                self._search_best_scale(self.modules[i], **layer)
-                for layer in module_config
-            ]
-            apply_scale(self.modules[i], scales_list, input_feat_dict=input_feat)
-            scales_list = append_str_prefix(
-                scales_list, get_op_name(self.model, self.modules[i]) + "."
-            )
-
-            # [STEP 3]: Compute and apply clipping list
-            if self.apply_clip:
-                clip_list = self._search_best_clip(
-                    self.modules[i], named_linears, input_feat
-                )
-                apply_clip(self.modules[i], clip_list)
-                clip_list = append_str_prefix(
-                    clip_list, get_op_name(self.model, self.modules[i]) + "."
-                )
-
-            # [STEP 4]: Quantize weights
-            if not self.export_compatible:
-                self._apply_quant(self.modules[i], named_linears)
-
-            clear_memory()
+                clear_memory()
 
     def pack(self):
         for i in tqdm(range(len(self.modules)), desc="Packing"):
@@ -240,7 +304,7 @@ class AwqQuantizer:
             q_linear = q_linear_module.from_linear(
                 linear=linear_layer,
                 w_bit=self.w_bit,
-                group_size=self.group_size,
+                group_size_2d=self.group_size,
                 init_only=False,
                 scales=scales,
                 zeros=zeros,
@@ -301,14 +365,50 @@ class AwqQuantizer:
         # All layer weights are concatted together
         weight = torch.cat([_m.weight for _m in layers], dim=0)
         org_shape = weight.shape
-        # The weights are reshaped to be organised by quantization group
-        weight = weight.view(-1, self.group_size)
-        # Calculates the relative magnitude of the weights within each of the quantization groups,
-        # and rescales each group individually so that each group has weights on a 0-1 scale.
-        w_scale = weight.abs() / (weight.abs().amax(dim=1, keepdim=True) + 1e-6)
-        # Resizes the rescaled weight matrix back up to its original dimensions
-        w_scale = w_scale.view(org_shape)
-        # Gets the average rescaled magnitude for each output channel
+        # 新增：二维分块逻辑
+        #########################################################
+        # 确保输入尺寸能被 group_size 整除（若不能整除，这里会截断）
+        group_size_2d = self.group_size  # 二维分块的边长
+        M, N = org_shape[-2], org_shape[-1]  # 假设权重是二维矩阵
+
+        # 计算可分割的块数并截断
+        blocks_per_row = M // group_size_2d
+        blocks_per_col = N // group_size_2d
+        cropped_M = blocks_per_row * group_size_2d
+        cropped_N = blocks_per_col * group_size_2d
+
+        # 截取可被整除的部分
+        weight = weight[:cropped_M, :cropped_N]
+
+        # 将权重重新组织为二维块结构
+        # [总块数, 块内元素数] = [blocks_per_row*blocks_per_col, group_size_2d^2]
+        weight_blocks = weight.view(
+            blocks_per_row, group_size_2d,
+            blocks_per_col, group_size_2d
+        )
+        # 调整维度顺序以合并块索引
+        weight_blocks = weight_blocks.permute(0, 2, 1, 3)  # [blocks_per_row, blocks_per_col, group_size_2d, group_size_2d]
+        weight_blocks = weight_blocks.contiguous().view(-1, group_size_2d * group_size_2d)
+
+        # 按二维块计算归一化
+        w_scale = weight_blocks.abs() / (weight_blocks.abs().amax(dim=1, keepdim=True) + 1e-6)
+
+        # 恢复原始形状（包含截断后的尺寸）
+        w_scale = w_scale.view(
+            blocks_per_row, blocks_per_col,
+            group_size_2d, group_size_2d
+        )
+        w_scale = w_scale.permute(0, 2, 1, 3)  # 恢复块的行列顺序
+        w_scale = w_scale.contiguous().view(cropped_M, cropped_N)
+
+        # 若原尺寸无法被整除，补零对齐原始形状
+        if cropped_M < M or cropped_N < N:
+            w_scale_full = torch.zeros(org_shape, dtype=w_scale.dtype, device=weight.device)
+            w_scale_full[:cropped_M, :cropped_N] = w_scale
+            w_scale = w_scale_full
+        #########################################################
+
+        # 后续计算通道均值（与原逻辑一致）
         w_mean = w_scale.mean(0)
         clear_memory(weight)
 
@@ -341,7 +441,7 @@ class AwqQuantizer:
             fp16_output = fp16_output.clip(torch.finfo(fp16_output.dtype).min, torch.finfo(fp16_output.dtype).max)
 
         # [STEP 4]: Compute loss
-        best_scales = self._compute_best_scale(
+        best_scales, best_loss = self._compute_best_scale(
             inp, w_mean, x_mean, module2inspect, layers, fp16_output, module_kwargs
         )
 
@@ -349,7 +449,7 @@ class AwqQuantizer:
             get_op_name(module, prev_op),
             tuple([get_op_name(module, m) for m in layers]),
             best_scales,
-        )
+        ), best_loss
 
     def _compute_best_scale(
         self,
@@ -425,7 +525,7 @@ class AwqQuantizer:
 
         assert torch.isnan(best_scales).sum() == 0, best_scales
 
-        return best_scales.detach().cpu()
+        return best_scales.detach().cpu(), best_error
 
     @torch.no_grad()
     def _compute_loss(

@@ -1,8 +1,12 @@
+import sys
+import os
+sys.path.append(os.path.abspath("/root/AutoAWQ/build/lib"))
+print(sys.path)
 from awq import AutoAWQForCausalLM
 from transformers import AutoTokenizer
 
-model_path = 'Qwen/Qwen2.5-14B-Instruct'
-quant_path = 'Qwen2.5-14B-Instruct-awq'
+model_path = 'mistralai/Mistral-7B-Instruct-v0.2'
+quant_path = '../mistral-instruct-v0.2-awq-modified'
 quant_config = { "zero_point": True, "q_group_size": 128, "w_bit": 4, "version": "GEMM" }
 
 # Load model

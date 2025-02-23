@@ -167,11 +167,11 @@ class WQLinear_GEMM(nn.Module):
 
     @classmethod
     def from_linear(
-        cls, linear, w_bit, group_size, init_only=False, scales=None, zeros=None
+        cls, linear, w_bit, group_size_2d, init_only=False, scales=None, zeros=None
     ):
         awq_linear = cls(
             w_bit,
-            group_size,
+            group_size_2d,
             linear.in_features,
             linear.out_features,
             linear.bias is not None,
@@ -194,8 +194,8 @@ class WQLinear_GEMM(nn.Module):
         for idx in range(awq_linear.in_features):
             intweight.append(
                 torch.round(
-                    (linear.weight.data[:, idx] + scale_zeros[idx // group_size])
-                    / awq_linear.scales[idx // group_size]
+                    (linear.weight.data[:, idx] + scale_zeros[idx // group_size_2d])
+                    / awq_linear.scales[idx // group_size_2d]
                 ).to(torch.int)[:, None]
             )
         intweight = torch.cat(intweight, dim=1)
