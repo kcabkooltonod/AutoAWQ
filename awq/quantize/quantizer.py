@@ -22,7 +22,10 @@ from awq.utils.module import (
     set_op_by_name,
     exclude_layers_to_not_quantize,
 )
-
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+from tqdm import tqdm
 
 class AwqQuantizer:
     def __init__(
@@ -172,8 +175,43 @@ class AwqQuantizer:
 
         return w
 
+
+
+    def print_activation(self):
+        # for i in tqdm(range(len(self.modules)), desc="AWQ"):
+        named_linears = get_named_linears(self.modules[15])
+        input_feat = self._get_input_feat(self.modules[15], named_linears)
+        
+        # 遍历字典中的每个张量
+        for name, tensor in input_feat.items():
+            if name=="mlp.gate_proj":
+                print(f"Processing layer: {name}")
+                
+                # 将张量转换为 numpy 数组
+                # tensor_np = tensor.cpu().numpy() if hasattr(tensor, 'cpu') else np.array(tensor)
+                
+
+                if hasattr(tensor, 'cpu'):
+                    tensor_np = tensor.cpu().float().numpy()  # 先转换为 float32，再转换为 numpy
+                else:
+                    tensor_np = np.array(tensor, dtype=np.float32)  # 直接转换为 float32 的 numpy 数组
+                # 选择指定列（例如第一列）
+                col_index = 0  # 选择第 0 列（第一列）
+                column_data = tensor_np[:, col_index]
+                
+                # 绘制数据分布图
+                plt.figure(figsize=(10, 6))
+                sns.histplot(column_data, kde=True, bins=50)
+                plt.title(f'Distribution of Column {col_index} in Layer {name}')
+                plt.xlabel('Value')
+                plt.ylabel('Frequency')
+                plt.savefig(f'layer_15_distribution_{name}_col_{col_index}.png')  # 保存图像
+                plt.show()
+
+
+
     def quantize(self):
-        with open('loss_scales_records_awq_modified.csv', 'w') as f:
+        with open('loss_scales_records_qwen_awq_modified.csv', 'w') as f:
             f.write('layer_idx,best_loss,name\n')
             for i in tqdm(range(len(self.modules)), desc="AWQ"):
                 # Move module and inputs to correct device
@@ -184,7 +222,8 @@ class AwqQuantizer:
                         best_device = "cuda:2"
                     else:
                         best_device = get_best_device()
-
+                    
+                    print(best_device)
                     self.modules[i] = self.modules[i].to(best_device)
                     common_device = next(self.modules[i].parameters()).device
 

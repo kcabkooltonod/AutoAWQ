@@ -239,6 +239,7 @@ class BaseAWQForCausalLM(nn.Module):
             **kwargs,
         )
         self.quantizer.quantize()
+        # self.quantizer.print_activation()
 
         self.is_quantized = True
 
