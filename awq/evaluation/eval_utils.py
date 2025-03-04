@@ -160,8 +160,48 @@ def eval_mmlu(
         device=device,
         log_samples=False,
     )
+    with open("/root/AutoAWQ/awq_modified_mmlu_output_table.md", "w", encoding="utf-8") as f:
+        f.write(make_table(results))
+    # print(results)
+    
+def make_table(result_dict):
+    """Generate table of results."""
+    from pytablewriter import MarkdownTableWriter, LatexTableWriter
 
-    print(evaluator.make_table(results))
+    md_writer = MarkdownTableWriter()
+    latex_writer = LatexTableWriter()
+    md_writer.headers = ["Task", "Version", "Filter", "Metric", "Value", "", "Stderr"]
+    latex_writer.headers = [
+        "Task",
+        "Version",
+        "Filter",
+        "Metric",
+        "Value",
+        "",
+        "Stderr",
+    ]
+
+    values = []
+
+    for k, dic in result_dict["results"].items():
+        version = result_dict["versions"][k]
+        for (mf), v in dic.items():
+            m, _, f = mf.partition(",")
+            if m.endswith("_stderr"):
+                continue
+
+            if m + "_stderr" + "," + f in dic:
+                se = dic[m + "_stderr" + "," + f]
+                values.append([k, version, f, m, "%.4f" % v, "±", "%s" % se])
+            else:
+                values.append([k, version, f, m, "%s" % v, "", ""])
+            k = ""
+            version = ""
+    md_writer.value_matrix = values
+    latex_writer.value_matrix = values
+
+    return md_writer.dumps()
+
 
 
 if __name__ == "__main__":
