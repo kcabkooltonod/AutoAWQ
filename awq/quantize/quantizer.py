@@ -22,8 +22,8 @@ from awq.utils.module import (
     set_op_by_name,
     exclude_layers_to_not_quantize,
 )
-import matplotlib.pyplot as plt
-import seaborn as sns
+# import matplotlib.pyplot as plt
+# import seaborn as sns
 import numpy as np
 from tqdm import tqdm
 
@@ -81,23 +81,11 @@ class AwqQuantizer:
         group_size_2d = self.group_size  
         M, N = w.shape[-2], w.shape[-1] 
         # print(M, N)
-        # 确保输入尺寸能被 group_size_2d 整除
         blocks_per_row = M // group_size_2d
         blocks_per_col = N // group_size_2d
-        cropped_M = blocks_per_row * group_size_2d
-        cropped_N = blocks_per_col * group_size_2d
-
-        # 截取可被整除的部分
-        w = w[:cropped_M, :cropped_N]
 
         # w: [M, N] -> [blocks_per_row, blocks_per_col, group_size_2d, group_size_2d]
-        w = w.view(
-            blocks_per_row, group_size_2d,
-            blocks_per_col, group_size_2d
-        )
-
-        # [blocks_per_row, blocks_per_col, group_size_2d, group_size_2d]
-        w = w.permute(0, 2, 1, 3)
+        w = w.unfold(0, group_size_2d, group_size_2d).unfold(1, group_size_2d, group_size_2d)
         # [blocks_per_row*blocks_per_col, group_size_2d*group_size_2d]
         w = w.contiguous().view(-1, group_size_2d * group_size_2d)
 
@@ -117,8 +105,8 @@ class AwqQuantizer:
             ) * scales
             zeros = zeros.view(blocks_per_row, blocks_per_col, group_size_2d, group_size_2d)
             zeros = zeros.permute(0, 2, 1, 3)  # 恢复块的行列顺序
-            zeros = zeros.contiguous().view(cropped_M, cropped_N)
-            zeros = zeros[:, ::128]
+            zeros = zeros.contiguous().view(M, N)
+            zeros = zeros[:, ::group_size_2d]
         else:
             max_val = w.abs().amax(dim=1, keepdim=True)
             max_val = max_val.clamp(min=1e-5)
@@ -134,28 +122,13 @@ class AwqQuantizer:
         # 恢复原始形状
         scales = scales.view(blocks_per_row, blocks_per_col, group_size_2d, group_size_2d)
         scales = scales.permute(0, 2, 1, 3)
-        scales = scales.contiguous().view(cropped_M, cropped_N)
-        scales = scales[:, ::128]
+        scales = scales.contiguous().view(M, N)
+        scales = scales[:, ::group_size_2d]
 
         w = w.view(blocks_per_row, blocks_per_col, group_size_2d, group_size_2d)
         w = w.permute(0, 2, 1, 3)
-        w = w.contiguous().view(cropped_M, cropped_N)
+        w = w.contiguous().view(M, N)
         w = w.reshape(org_w_shape)
-
-        # 若原尺寸无法被整除，补零对齐原始形状
-        if cropped_M < M or cropped_N < N:
-            w_full = torch.zeros(org_w_shape, dtype=w.dtype, device=w.device)
-            w_full[:cropped_M, :cropped_N] = w
-            w = w_full
-
-            scales_full = torch.zeros(org_w_shape, dtype=scales.dtype, device=w.device)
-            scales_full[:cropped_M, :cropped_N] = scales
-            scales = scales_full
-
-            if zeros is not None:
-                zeros_full = torch.zeros(org_w_shape, dtype=zeros.dtype, device=w.device)
-                zeros_full[:cropped_M, :cropped_N] = zeros
-                zeros = zeros_full
 
         return w, scales, zeros
 
@@ -177,41 +150,41 @@ class AwqQuantizer:
 
 
 
-    def print_activation(self):
-        # for i in tqdm(range(len(self.modules)), desc="AWQ"):
-        named_linears = get_named_linears(self.modules[15])
-        input_feat = self._get_input_feat(self.modules[15], named_linears)
+    # def print_activation(self):
+    #     # for i in tqdm(range(len(self.modules)), desc="AWQ"):
+    #     named_linears = get_named_linears(self.modules[15])
+    #     input_feat = self._get_input_feat(self.modules[15], named_linears)
         
-        # 遍历字典中的每个张量
-        for name, tensor in input_feat.items():
-            if name=="mlp.gate_proj":
-                print(f"Processing layer: {name}")
+    #     # 遍历字典中的每个张量
+    #     for name, tensor in input_feat.items():
+    #         if name=="mlp.gate_proj":
+    #             print(f"Processing layer: {name}")
                 
-                # 将张量转换为 numpy 数组
-                # tensor_np = tensor.cpu().numpy() if hasattr(tensor, 'cpu') else np.array(tensor)
+    #             # 将张量转换为 numpy 数组
+    #             # tensor_np = tensor.cpu().numpy() if hasattr(tensor, 'cpu') else np.array(tensor)
                 
 
-                if hasattr(tensor, 'cpu'):
-                    tensor_np = tensor.cpu().float().numpy()  # 先转换为 float32，再转换为 numpy
-                else:
-                    tensor_np = np.array(tensor, dtype=np.float32)  # 直接转换为 float32 的 numpy 数组
-                # 选择指定列（例如第一列）
-                col_index = 0  # 选择第 0 列（第一列）
-                column_data = tensor_np[:, col_index]
+    #             if hasattr(tensor, 'cpu'):
+    #                 tensor_np = tensor.cpu().float().numpy()  # 先转换为 float32，再转换为 numpy
+    #             else:
+    #                 tensor_np = np.array(tensor, dtype=np.float32)  # 直接转换为 float32 的 numpy 数组
+    #             # 选择指定列（例如第一列）
+    #             col_index = 0  # 选择第 0 列（第一列）
+    #             column_data = tensor_np[:, col_index]
                 
-                # 绘制数据分布图
-                plt.figure(figsize=(10, 6))
-                sns.histplot(column_data, kde=True, bins=50)
-                plt.title(f'Distribution of Column {col_index} in Layer {name}')
-                plt.xlabel('Value')
-                plt.ylabel('Frequency')
-                plt.savefig(f'layer_15_distribution_{name}_col_{col_index}.png')  # 保存图像
-                plt.show()
+    #             # 绘制数据分布图
+    #             plt.figure(figsize=(10, 6))
+    #             sns.histplot(column_data, kde=True, bins=50)
+    #             plt.title(f'Distribution of Column {col_index} in Layer {name}')
+    #             plt.xlabel('Value')
+    #             plt.ylabel('Frequency')
+    #             plt.savefig(f'layer_15_distribution_{name}_col_{col_index}.png')  # 保存图像
+    #             plt.show()
 
 
 
     def quantize(self):
-        with open('loss_scales_records_qwen_awq_modified.csv', 'w') as f:
+        with open('loss_scales_records_awq_modified_version2.csv', 'w') as f:
             f.write('layer_idx,best_loss,name\n')
             for i in tqdm(range(len(self.modules)), desc="AWQ"):
                 # Move module and inputs to correct device
@@ -226,6 +199,7 @@ class AwqQuantizer:
                     print(best_device)
                     self.modules[i] = self.modules[i].to(best_device)
                     common_device = next(self.modules[i].parameters()).device
+                    # print(common_device)
 
                 if self.module_kwargs.get("position_ids") is not None:
                     self.module_kwargs["position_ids"] = self.module_kwargs[
@@ -404,45 +378,14 @@ class AwqQuantizer:
         # All layer weights are concatted together
         weight = torch.cat([_m.weight for _m in layers], dim=0)
         org_shape = weight.shape
-        # 新增：二维分块逻辑
-        group_size_2d = self.group_size 
-        M, N = org_shape[-2], org_shape[-1]
-
-        blocks_per_row = M // group_size_2d
-        blocks_per_col = N // group_size_2d
-        cropped_M = blocks_per_row * group_size_2d
-        cropped_N = blocks_per_col * group_size_2d
-
-        weight = weight[:cropped_M, :cropped_N]
-
-        # [blocks_per_row*blocks_per_col, group_size_2d^2]
-        weight_blocks = weight.view(
-            blocks_per_row, group_size_2d,
-            blocks_per_col, group_size_2d
-        )
-        # 调整维度顺序以合并块索引
-        # [blocks_per_row, blocks_per_col, group_size_2d, group_size_2d]
-        weight_blocks = weight_blocks.permute(0, 2, 1, 3)
-        weight_blocks = weight_blocks.contiguous().view(-1, group_size_2d * group_size_2d)
-
-        # 按二维块计算归一化
-        w_scale = weight_blocks.abs() / (weight_blocks.abs().amax(dim=1, keepdim=True) + 1e-6)
-
-        # 恢复原始形状
-        w_scale = w_scale.view(
-            blocks_per_row, blocks_per_col,
-            group_size_2d, group_size_2d
-        )
-        w_scale = w_scale.permute(0, 2, 1, 3)
-        w_scale = w_scale.contiguous().view(cropped_M, cropped_N)
-
-        # 若原尺寸无法被整除，补零对齐原始形状
-        if cropped_M < M or cropped_N < N:
-            w_scale_full = torch.zeros(org_shape, dtype=w_scale.dtype, device=weight.device)
-            w_scale_full[:cropped_M, :cropped_N] = w_scale
-            w_scale = w_scale_full
-
-        # 后续计算通道均值（与原逻辑一致）
+        # The weights are reshaped to be organised by quantization group
+        weight = weight.view(-1, self.group_size)
+        # Calculates the relative magnitude of the weights within each of the quantization groups,
+        # and rescales each group individually so that each group has weights on a 0-1 scale.
+        w_scale = weight.abs() / (weight.abs().amax(dim=1, keepdim=True) + 1e-6)
+        # Resizes the rescaled weight matrix back up to its original dimensions
+        w_scale = w_scale.view(org_shape)
+        # Gets the average rescaled magnitude for each output channel
         w_mean = w_scale.mean(0)
         clear_memory(weight)
 
@@ -633,7 +576,7 @@ class AwqQuantizer:
         step_size = max(1, input_feat.shape[1] // n_sample_token)
         input_feat = input_feat[:, ::step_size]
         
-        w = w.reshape(org_w_shape[0], 1, -1, group_size)
+        # w = w.reshape(org_w_shape[0], 1, -1, group_size)
 
         oc_batch_size = 256 if org_w_shape[0] % 256 == 0 else 64  # prevent OOM
         assert org_w_shape[0] % oc_batch_size == 0
@@ -643,11 +586,37 @@ class AwqQuantizer:
         for i_b in range(org_w_shape[0] // oc_batch_size):
             w = w_all[i_b * oc_batch_size : (i_b + 1) * oc_batch_size]
 
-            org_max_val = w.abs().amax(dim=-1, keepdim=True)  # co, 1, n_group, 1
+            M, N = w.shape[-2], w.shape[-1]
+            blocks_per_row = M // group_size
+            blocks_per_col = N // group_size
+
+            # change to [n_block, group_size * group_size]
+            w = w.unfold(0, group_size, group_size).unfold(1, group_size, group_size)
+            w = w.contiguous().view(-1, group_size * group_size)
+
+            # compute abs max per block
+            org_max_val = w.abs().amax(dim=-1, keepdim=True).expand_as(w)
+            
+            # change back to [co, ci]
+            org_max_val = org_max_val.view(blocks_per_row, blocks_per_col, group_size, group_size)
+            org_max_val = org_max_val.permute(0, 2, 1, 3)
+            org_max_val = org_max_val.contiguous().view(M, N)
+
+            # change to [co, n_group]
+            org_max_val = org_max_val[:, ::group_size]
+            org_max_val = org_max_val.view(M, 1, -1, 1)
+
+
+            w = w.view(blocks_per_row, blocks_per_col, group_size, group_size)
+            w = w.permute(0, 2, 1, 3)
+            w = w.contiguous().view(M, N)
+            w = w.reshape(w.shape[0], 1, -1, group_size)
+            # org_max_val = w.abs().amax(dim=-1, keepdim=True)  # co, 1, n_group, 1
 
             best_max_val = org_max_val.clone()
             min_errs = torch.ones_like(org_max_val) * 1e9
             input_feat = input_feat.to(w.device)
+            # print(w.device)
             org_out = (input_feat * w).sum(dim=-1)  # co, n_token, n_group
 
             for i_s in range(int(max_shrink * n_grid)):
